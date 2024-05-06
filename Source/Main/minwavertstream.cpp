@@ -4,6 +4,7 @@
 #include "endpoints.h"
 #include "minwavert.h"
 #include "minwavertstream.h"
+#include "AudioBufferQueue.h"
 #define MINWAVERTSTREAM_POOLTAG 'SRWM'
 
 #pragma warning (disable : 4127)
@@ -96,7 +97,7 @@ Return Value:
     // DPCs to complete before we free the notification DPC.
     //
     KeFlushQueuedDpcs();
-
+    DestroyByteQueue(&g_stCaptureAudioBufferQueue);
     DPF_ENTER(("[CMiniportWaveRTStream::~CMiniportWaveRTStream]"));
 } // ~CMiniportWaveRTStream
 
@@ -242,6 +243,8 @@ Return Value:
     {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+
+    InitializeBufferQueue(&g_stCaptureAudioBufferQueue, CAPTURE_BUFFER_QUEUE_SIZE);
 
     pWfEx = GetWaveFormatEx(DataFormat_);
     if (NULL == pWfEx) 
@@ -782,7 +785,7 @@ NTSTATUS CMiniportWaveRTStream::GetPosition
         // Get the current time and update position.
         //
         LARGE_INTEGER ilQPC = KeQueryPerformanceCounter(NULL);
-        UpdatePosition(ilQPC);
+       // UpdatePosition(ilQPC);
     }
 
     Position_->PlayOffset = m_ullPlayPosition;
@@ -1021,7 +1024,7 @@ NTSTATUS CMiniportWaveRTStream::GetPacketCount
     {
         // Get the current time and update simulated position.
         LARGE_INTEGER ilQPC = KeQueryPerformanceCounter(NULL);
-        UpdatePosition(ilQPC);
+        //UpdatePosition(ilQPC);
     }
 
     *pPacketCount = LODWORD(m_llPacketCounter);
@@ -1055,7 +1058,7 @@ NTSTATUS CMiniportWaveRTStream::GetPositions(
     ilQPC = KeQueryPerformanceCounter(NULL);
     if (m_KsState == KSSTATE_RUN)
     {
-        UpdatePosition(ilQPC);
+        //UpdatePosition(ilQPC);
     }
     if (_pullLinearBufferPosition)
     {
@@ -1170,6 +1173,7 @@ NTSTATUS CMiniportWaveRTStream::SetState
     switch (State_)
     {
         case KSSTATE_STOP:
+            DbgPrint("KSSTATE_STOP: \n");
             if (m_KsState == KSSTATE_ACQUIRE)
             {
                 // Acquire stream resources
@@ -1191,6 +1195,26 @@ NTSTATUS CMiniportWaveRTStream::SetState
 
             KeReleaseSpinLock(&m_PositionSpinLock, oldIrql);
 
+			if (!m_bCapture)
+			{
+                DbgPrint("Render KSSTATE_STOP \n");
+				if (g_pRenderStoptEvent)
+				{
+                    DbgPrint("KeSetEvent(g_pRenderStoptEvent, 0, true); \n");
+					KeSetEvent(g_pRenderStoptEvent, 0, true);
+                    g_bCurRenderStart = false;
+				}
+			}
+			else
+			{
+				if (g_pCaptureStopEvent)
+				{
+                    DbgPrint("KeSetEvent(g_pCaptureStopEvent, 0, true); \n");
+					KeSetEvent(g_pCaptureStopEvent, 0, true);
+                    g_bCurCaptureStart = false;
+				}
+			}
+
             // Wait until all work items are completed.
             if (!m_bCapture && !g_DoNotCreateDataFiles)
             {
@@ -1199,14 +1223,35 @@ NTSTATUS CMiniportWaveRTStream::SetState
             break;
 
         case KSSTATE_ACQUIRE:
+            DbgPrint("KSSTATE_ACQUIRE: \n");
             if (m_KsState == KSSTATE_STOP)
             {
                 // Acquire stream resources
+				if (!m_bCapture)
+				{
+                    DbgPrint("Render KSSTATE_ACQUIRE \r\n");
+					if (g_pRenderStartEvent)
+					{
+                        DbgPrint("  KeSetEvent(g_pRenderStartEvent, 0, true) \n");
+						KeSetEvent(g_pRenderStartEvent, 0, true);
+                        g_bCurRenderStart = true;
+					}
+				}
+				else
+				{
+					if (g_pCaptureStartEvent)
+					{
+                        ClearBufferQueue(&g_stCaptureAudioBufferQueue);
+                        DbgPrint("  KeSetEvent(g_pCaptureStartEvent, 0, true) \n");
+                        KeSetEvent(g_pCaptureStartEvent, 0, true);
+                        g_bCurCaptureStart = true;
+					}
+				}
             }
             break;
             
         case KSSTATE_PAUSE:
-
+            DbgPrint("KSSTATE_PAUSE: \n");
             if (m_KsState > KSSTATE_PAUSE)
             {
                 //
@@ -1240,6 +1285,7 @@ NTSTATUS CMiniportWaveRTStream::SetState
             break;
 
         case KSSTATE_RUN:
+            DbgPrint("KSSTATE_RUN: \n");
             // Start DMA
             LARGE_INTEGER ullPerfCounterTemp;
             ullPerfCounterTemp = KeQueryPerformanceCounter(&m_ullPerformanceCounterFrequency);
@@ -1321,7 +1367,15 @@ VOID CMiniportWaveRTStream::UpdatePosition
     m_byteDisplacementCarryForward = ((m_ulDmaMovementRate * TimeElapsedInMS) + m_byteDisplacementCarryForward) % 1000;
 
     // Increment presentation position even after last buffer is rendered.
-    m_ullPresentationPosition += ByteDisplacement;
+    if (m_bCapture)
+	{
+		ByteDisplacement = 3840;
+    }
+
+	m_ullPresentationPosition += ByteDisplacement;
+
+
+  //  DbgPrint(" m_ullPresentationPosition = %d  ByteDisplacement = %d \r\n", m_byteDisplacementCarryForward, ByteDisplacement);
 
     if (m_bCapture)
     {
@@ -1398,19 +1452,45 @@ ByteDisplacement - # of bytes to process.
 
 --*/
 {
-    ULONG bufferOffset = m_ullLinearPosition % m_ulDmaBufferSize;
 
-    // Normally this will loop no more than once for a single wrap, but if
-    // many bytes have been displaced then this may loops many times.
-    while (ByteDisplacement > 0)
-    {
-        ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
-        
-        m_ToneGenerator.GenerateSine(m_pDmaBuffer + bufferOffset, runWrite);
-           	
-        bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
-        ByteDisplacement -= runWrite;
-    }
+	ULONG bufferOffset = m_ullLinearPosition % m_ulDmaBufferSize;
+  //  bool bflag = false;
+    
+	while (ByteDisplacement > 0)
+	{
+		ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
+		if (g_bCurCaptureStart)
+		{
+  //          ULONG ulQueBufferSize = GetBufferQueueSize(&g_stCaptureAudioBufferQueue);
+		//	// pData = (BYTE*)Dequeue(&g_stCaptureQueue, &ulNum);
+		//	if (ulQueBufferSize > m_ulDmaBufferSize)
+		//	{
+				ULONG ulRealNum = 0;
+				DequeueBuffer(&g_stCaptureAudioBufferQueue, m_pDmaBuffer + bufferOffset, runWrite, &ulRealNum);
+
+				if (ulRealNum != runWrite)
+				{
+					//ฒน0
+					RtlZeroMemory(m_pDmaBuffer + bufferOffset + ulRealNum, runWrite - ulRealNum);
+					// CosineFadeOut32Bit(m_pDmaBuffer + bufferOffset + ulRealNum, runWrite - ulRealNum);
+					DbgPrint("ulRealNum != runWrite ulRealNum = %d  runWrite = %d   ByteDisplacement = %d \r\n", ulRealNum, runWrite, ByteDisplacement);
+				}
+		/*	}
+            else
+            {
+				RtlZeroMemory(m_pDmaBuffer + bufferOffset, runWrite);
+			}*/
+			
+		}
+        else
+        {
+			//m_ToneGenerator.GenerateSine(m_pDmaBuffer + bufferOffset, runWrite);
+			RtlZeroMemory(m_pDmaBuffer + bufferOffset, runWrite);
+		}
+
+		bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
+		ByteDisplacement -= runWrite;
+	}
 }
 
 //=============================================================================
@@ -1438,7 +1518,7 @@ ByteDisplacement - # of bytes to process.
     while (ByteDisplacement > 0)
     {
         ULONG runWrite = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
-        m_SaveData.WriteData(m_pDmaBuffer + bufferOffset, runWrite);
+      //  m_SaveData.WriteData(m_pDmaBuffer + bufferOffset, runWrite);
         bufferOffset = (bufferOffset + runWrite) % m_ulDmaBufferSize;
         ByteDisplacement -= runWrite;
     }
@@ -1580,12 +1660,28 @@ TimerNotifyRT
         bufferCompleted = TRUE;
     }
 
-    if (!bufferCompleted && !_this->m_bEoSReceived)
-    {
-        goto End;
-    }
+	
+	else if (!bufferCompleted && !_this->m_bEoSReceived)
+	{
+		goto End;
+	}
 
-    _this->UpdatePosition(qpc);
+    if (_this->m_bCapture)
+    {
+		if (GetBufferQueueSize(&g_stCaptureAudioBufferQueue) > 3840)
+		{
+			_this->UpdatePosition(qpc);
+		}
+		else
+		{
+			goto End;
+		}
+    }
+    else
+    {
+		_this->UpdatePosition(qpc);
+	}
+
 
     if (!_this->m_bEoSReceived)
     {

@@ -263,6 +263,7 @@
     </DriverSign>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="AudioBufferQueue.cpp" />
     <ClCompile Include="hw.cpp" />
     <ClCompile Include="kshelper.cpp" />
     <ClCompile Include="savedata.cpp" />
@@ -278,7 +279,7 @@
     <None Exclude="@(None)" Include="*.def;*.bat;*.hpj;*.asmx" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Exclude="@(ClInclude)" Include="*.h;*.hpp;*.hxx;*.hm;*.inl;*.xsd" />
+    <ClInclude Include="AudioBufferQueue.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

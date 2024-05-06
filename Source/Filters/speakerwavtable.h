@@ -19,8 +19,8 @@ Abstract:
 #define SPEAKER_DEVICE_MAX_CHANNELS                 2       // Max Channels.
 
 #define SPEAKER_HOST_MAX_CHANNELS                   2       // Max Channels.
-#define SPEAKER_HOST_MIN_BITS_PER_SAMPLE            16      // Min Bits Per Sample
-#define SPEAKER_HOST_MAX_BITS_PER_SAMPLE            16      // Max Bits Per Sample
+#define SPEAKER_HOST_MIN_BITS_PER_SAMPLE            32      // Min Bits Per Sample
+#define SPEAKER_HOST_MAX_BITS_PER_SAMPLE            32      // Max Bits Per Sample
 #define SPEAKER_HOST_MIN_SAMPLE_RATE                48000   // Min Sample Rate
 #define SPEAKER_HOST_MAX_SAMPLE_RATE                48000   // Max Sample Rate
 
@@ -49,12 +49,12 @@ KSDATAFORMAT_WAVEFORMATEXTENSIBLE SpeakerHostPinSupportedDeviceFormats[] =
                 WAVE_FORMAT_EXTENSIBLE,
                 2,
                 48000,
-                192000,
-                4,
-                16,
+                384000,
+                8,
+                32,
                 sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
             },
-            16,
+            32,
             KSAUDIO_SPEAKER_STEREO,
             STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
         }

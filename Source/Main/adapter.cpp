@@ -22,10 +22,132 @@ Abstract:
 #include "definitions.h"
 #include "endpoints.h"
 #include "minipairs.h"
+#include "AudioBufferQueue.h"
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
 extern "C" DRIVER_UNLOAD DriverUnload;
+
+#define IOCTL_INIT_EVENT            (ULONG)CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ALL_ACCESS)
+#define IOCTL_SEND_CAPTURE_DATA     (ULONG)CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_ALL_ACCESS)
+
+#define DEVICE_NAME L"\\Device\\TestDriver"
+#define LINK_NAME L"\\??\\Test"
+
+void InitEvent(PKEVENT& pEvent, HANDLE& hEventHandle, const WCHAR* pEventName)
+{
+    DbgPrint("InitEvent!\n");
+	UNICODE_STRING stEventName;
+	if (pEvent == NULL)
+	{
+		RtlInitUnicodeString(&stEventName, pEventName);
+        pEvent = IoCreateSynchronizationEvent(
+			&stEventName,
+			&hEventHandle
+		);
+
+        if (!pEvent)
+        {
+            DbgPrint("Create Event Error!\n");
+        }
+        else
+        {
+            DbgPrint("Create Event succ!\n");
+        }
+	}
+
+}
+
+NTSTATUS DeviceIoControl(
+
+	PDEVICE_OBJECT pDeviceObject,
+	PIRP pIrp)
+
+{
+	PIO_STACK_LOCATION pPSL;
+
+	NTSTATUS status = STATUS_SUCCESS;
+
+	// 获取当前 IRP 的堆栈位置
+	pPSL = IoGetCurrentIrpStackLocation(pIrp);
+	// 得到输入输出缓冲长度
+	ULONG inBufLength = pPSL->Parameters.DeviceIoControl.InputBufferLength;
+
+	switch (pPSL->Parameters.DeviceIoControl.IoControlCode)
+	{
+	case IOCTL_INIT_EVENT:
+
+        InitEvent(g_pRenderStartEvent, g_RenderStartEventHandle, RENDER_START_EVENT_NAME);
+        InitEvent(g_pCaptureStartEvent, g_CaptureStartEventHandle, CAPTURE_START_EVENT_NAME);
+        InitEvent(g_pRenderStoptEvent, g_RenderStopEventHandle, RENDER_STOP_EVENT_NAME);
+        InitEvent(g_pCaptureStopEvent, g_CaptureStopEventHandle, CAPTURE_STOP_EVENT_NAME);
+
+        if (g_bCurCaptureStart)
+        {
+            KeSetEvent(g_pCaptureStartEvent, 0, false);
+        }
+
+        if (g_bCurRenderStart)
+        {
+			KeSetEvent(g_pRenderStartEvent, 0, false);
+		}
+
+		pIrp->IoStatus.Status = status;
+		pIrp->IoStatus.Information = 0;
+		IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+		return status;
+	case IOCTL_SEND_CAPTURE_DATA:
+		if (inBufLength > 0)
+		{
+            EnqueueBuffer(&g_stCaptureAudioBufferQueue, pIrp->AssociatedIrp.SystemBuffer, inBufLength);
+		}
+
+		pIrp->IoStatus.Status = status;
+		pIrp->IoStatus.Information = 0; 
+		IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+		return status;
+	default:
+
+		pIrp->IoStatus.Information = 0;
+		pIrp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+		status = STATUS_INVALID_DEVICE_REQUEST;
+		break;
+	}
+
+	return PcDispatchIrp(pDeviceObject, pIrp);
+}
+
+
+NTSTATUS DrvClose(_In_ PDEVICE_OBJECT pDeviceObject, _In_ PIRP pIrp)
+{
+	auto pPSL = IoGetCurrentIrpStackLocation(pIrp);
+	if (pPSL->Parameters.DeviceIoControl.IoControlCode != IOCTL_INIT_EVENT
+		&& pPSL->Parameters.DeviceIoControl.IoControlCode != IOCTL_SEND_CAPTURE_DATA)
+	{
+		return PcDispatchIrp(pDeviceObject, pIrp);
+	}
+
+	pIrp->IoStatus.Status = STATUS_SUCCESS;
+	pIrp->IoStatus.Information = 0;
+	IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+	return STATUS_SUCCESS;
+}
+
+
+NTSTATUS DrvCreate(_In_ PDEVICE_OBJECT pDeviceObject, _In_ PIRP pIrp)
+{
+	auto pPSL = IoGetCurrentIrpStackLocation(pIrp);
+	if (pPSL->Parameters.DeviceIoControl.IoControlCode != IOCTL_INIT_EVENT
+		&& pPSL->Parameters.DeviceIoControl.IoControlCode != IOCTL_SEND_CAPTURE_DATA)
+	{
+		return PcDispatchIrp(pDeviceObject, pIrp);
+	}
+
+	pIrp->IoStatus.Status = STATUS_SUCCESS;
+	pIrp->IoStatus.Information = 0;
+	IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+	return STATUS_SUCCESS;
+}
 
 //-----------------------------------------------------------------------------
 // Referenced forward.
@@ -293,6 +415,29 @@ Return Value:
         DPF(D_ERROR, ("Registry path copy error 0x%x", ntStatus)),
         Done);
 
+	UNICODE_STRING strDeviceName;
+	UNICODE_STRING strSymbolicName;
+	PDEVICE_OBJECT pDevObj;
+
+	//初始化设备名称和链接名称
+	RtlInitUnicodeString(&strDeviceName, DEVICE_NAME);
+	RtlInitUnicodeString(&strSymbolicName, LINK_NAME);
+
+	ntStatus = IoCreateDevice(DriverObject, 0, &strDeviceName, FILE_DEVICE_UNKNOWN, 0, FALSE, &pDevObj);
+	if (!NT_SUCCESS(ntStatus))
+	{
+		DbgPrint("Create Device Error!\n");
+		return ntStatus;
+	}
+
+	ntStatus = IoCreateSymbolicLink(&strSymbolicName, &strDeviceName);
+	if (!NT_SUCCESS(ntStatus))
+	{
+		DbgPrint("Create SymbolicLink Error!\n");
+		IoDeleteDevice(pDevObj);
+		return ntStatus;
+	}
+
     //
     // Get registry configuration.
     //
@@ -337,7 +482,10 @@ Return Value:
     //
     // To intercept stop/remove/surprise-remove.
     //
-    DriverObject->MajorFunction[IRP_MJ_PNP] = PnpHandler;
+	DriverObject->MajorFunction[IRP_MJ_PNP] = PnpHandler;
+	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DeviceIoControl;
+	DriverObject->MajorFunction[IRP_MJ_CREATE] = DrvCreate;
+	DriverObject->MajorFunction[IRP_MJ_CLOSE] = DrvClose;
 
     //
     // Hook the port class unload function
